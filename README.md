@@ -310,7 +310,7 @@ Gear is filtered by activity type automatically. The following activity types an
 | cycling, road_biking, mountain_biking, indoor_cycling | Bike / Bikes |
 | All others | All active gear |
 
-Gear items must be **active** (not retired) in Garmin Connect to appear as options. Items with no display name are excluded.
+Gear items must be **active** (not retired) in Garmin Connect to appear as options. Items with no display name fall back to the custom make/model field.
 
 To add or modify activity type mappings, update the `ACTIVITY_GEAR_FILTER` dict in `garmin_service.py`.
 
