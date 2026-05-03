@@ -15,8 +15,8 @@ Garmin Connect tracks cumulative usage on gear like running shoes, but it only a
 ### System Overview
 
 ```
-┌─────────────────┐     polls every     ┌──────────────────────┐
-│  Garmin Connect │ ◄── 5 minutes ────  │  garmin-gear-bot     │
+┌─────────────────┐     polls at set    ┌──────────────────────┐
+│  Garmin Connect │ ◄── interval  ────  │  garmin-gear-bot     │
 │  (activity log) │                     │  (Python container)  │
 └─────────────────┘                     └──────────┬───────────┘
                                                    │ MQTT publish
@@ -57,7 +57,7 @@ Garmin Connect tracks cumulative usage on gear like running shoes, but it only a
 
 ### Step-by-Step Data Flow
 
-1. **Polling** — The Python service polls the Garmin Connect API every 5 minutes (configurable). It compares the most recent activity ID against a persisted last-seen ID stored in `/data/state.json`.
+1. **Polling** — The Python service polls the Garmin Connect API at a set interval. It compares the most recent activity ID against a persisted last-seen ID stored in `/data/state.json`.
 
 2. **New activity detected** — When a new activity is found, the service fetches your gear list and filters it to types relevant to the activity (e.g. shoes for a run, bikes for a ride). It publishes a JSON payload to the MQTT topic `garmin/activity/new`.
 
