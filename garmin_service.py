@@ -30,7 +30,7 @@ import paho.mqtt.client as mqtt
 try:
     from garminconnect import Garmin
 except ImportError:
-    print("ERROR: python-garminconnect not installed.")
+    print("ERROR: garminconnect not installed.")
     sys.exit(1)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -48,10 +48,10 @@ GARMIN_EMAIL      = os.environ["GARMIN_EMAIL"]
 GARMIN_PASSWORD   = os.environ["GARMIN_PASSWORD"]
 GARMIN_PROFILE_ID = int(os.environ["GARMIN_PROFILE_ID"])  # profileId, not id
 
-MQTT_HOST     = os.environ.get("MQTT_HOST", "localhost")
-MQTT_PORT     = int(os.environ.get("MQTT_PORT", 1883))
-MQTT_USER     = os.environ.get("MQTT_USER", "")
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
+MQTT_HOST      = os.environ.get("MQTT_HOST", "localhost")
+MQTT_PORT      = int(os.environ.get("MQTT_PORT", 1883))
+MQTT_USER      = os.environ.get("MQTT_USER", "")
+MQTT_PASS      = os.environ.get("MQTT_PASSWORD", "")
 MQTT_TOPIC_NEW_ACTIVITY = os.environ.get("MQTT_TOPIC_NEW_ACTIVITY", "garmin/activity/new")
 MQTT_TOPIC_GEAR_SELECT  = os.environ.get("MQTT_TOPIC_GEAR_SELECT",  "garmin/activity/gear_select")
 
@@ -74,6 +74,15 @@ ACTIVITY_GEAR_FILTER = {
     "indoor_cycling":    {"Bike", "Bikes"},
 }
 
+# ── Startup validation ────────────────────────────────────────────────────────
+
+if POLL_INTERVAL < 120:
+    log.warning(
+        "POLL_INTERVAL is %ss — this is very aggressive. "
+        "Recommend at least 120s to avoid Garmin rate limiting.",
+        POLL_INTERVAL,
+    )
+
 # ── State persistence ─────────────────────────────────────────────────────────
 
 def load_state():
@@ -93,12 +102,14 @@ def save_state(state):
 # ── Garmin auth ───────────────────────────────────────────────────────────────
 
 def garmin_authenticate():
-    """Authenticate, reusing saved tokens when available."""
-    api = Garmin()
-
+    """
+    Authenticate with Garmin Connect, reusing saved tokens when available.
+    Always returns a ready-to-use Garmin API object.
+    """
     if os.path.exists(TOKEN_FILE):
         log.info("Loading saved Garmin tokens from %s", TOKEN_FILE)
         try:
+            api = Garmin()
             with open(TOKEN_FILE, "rb") as f:
                 tokens = pickle.load(f)
             api.login(tokens)
@@ -127,16 +138,7 @@ def garmin_authenticate():
     return api
 
 
-def garmin_post(api, path, body=None):
-    """POST via the underlying client (bypasses connectapi's hardcoded GET)."""
-    kwargs = {"json": body} if body is not None else {}
-    resp = api.client._run_request("POST", path, **kwargs)
-    log.info("Garmin POST %s → status %s body: %s", path, resp.status_code, resp.text[:500])
-    try:
-        return resp.json()
-    except Exception:
-        return None
-
+# ── Garmin HTTP helpers ───────────────────────────────────────────────────────
 
 def garmin_put(api, path, body=None):
     """PUT via the underlying client (bypasses connectapi's hardcoded GET)."""
@@ -169,7 +171,7 @@ def fmt_distance(meters):
 
 
 def to_dashed_uuid(uuid_str):
-    """Convert a 32-char hex UUID to dashed format if not already dashed."""
+    """Convert a UUID to dashed format if not already dashed."""
     u = uuid_str.replace("-", "")
     return f"{u[0:8]}-{u[8:12]}-{u[12:16]}-{u[16:20]}-{u[20:]}"
 
@@ -205,17 +207,30 @@ def get_relevant_gear(api, activity_type):
 def check_for_new_activity(api, state, mqtt_client):
     """
     Fetch the latest activity. If it's new, publish it to MQTT with gear options.
-    Returns updated state.
+    Returns (updated_state, api) — api may be a new object if re-auth occurred.
     """
     try:
         activities = api.get_activities(0, 1)
     except Exception as e:
-        log.error("Failed to fetch activities from Garmin: %s", e)
-        return state
+        # Attempt re-authentication if the error looks like a token expiry
+        if any(k in str(e).lower() for k in ("401", "403", "authentication", "unauthorized")):
+            log.warning("Possible token expiry detected — attempting re-authentication")
+            try:
+                # Remove stale token file so garmin_authenticate does a fresh login
+                if os.path.exists(TOKEN_FILE):
+                    os.remove(TOKEN_FILE)
+                api = garmin_authenticate()
+                activities = api.get_activities(0, 1)
+            except Exception as auth_e:
+                log.error("Re-authentication failed: %s", auth_e)
+                return state, api
+        else:
+            log.error("Failed to fetch activities from Garmin: %s", e)
+            return state, api
 
     if not activities:
         log.debug("No activities returned from Garmin")
-        return state
+        return state, api
 
     latest   = activities[0]
     act_id   = latest.get("activityId")
@@ -227,7 +242,7 @@ def check_for_new_activity(api, state, mqtt_client):
 
     if str(act_id) == str(state.get("last_activity_id")):
         log.debug("No new activity (last seen: %s)", act_id)
-        return state
+        return state, api
 
     log.info("New activity detected: %s (ID: %s, type: %s)", act_name, act_id, act_type)
 
@@ -237,6 +252,17 @@ def check_for_new_activity(api, state, mqtt_client):
     except Exception as e:
         log.error("Failed to fetch gear: %s", e)
         gear_options = []
+
+    # If no gear is available for this activity type, record the activity as
+    # seen but skip the notification — there's nothing useful to ask the user.
+    if not gear_options:
+        log.warning(
+            "No relevant active gear found for activity type '%s' — "
+            "skipping notification for activity %s", act_type, act_id
+        )
+        state["last_activity_id"] = str(act_id)
+        save_state(state)
+        return state, api
 
     payload = {
         "activity_id":   act_id,
@@ -260,7 +286,7 @@ def check_for_new_activity(api, state, mqtt_client):
 
     state["last_activity_id"] = str(act_id)
     save_state(state)
-    return state
+    return state, api
 
 
 # ── Gear selection handler ────────────────────────────────────────────────────
@@ -279,13 +305,14 @@ def handle_gear_selection(api, payload_str):
         log.error("Invalid JSON in gear selection payload: %s", e)
         return
 
-    act_id    = int(payload.get("activity_id"))
-    gear_uuid = payload.get("gear_uuid")
-
-    if not act_id:
+    # Guard before int() conversion to avoid TypeError on missing key
+    raw_id = payload.get("activity_id")
+    if not raw_id:
         log.error("Gear selection payload missing activity_id: %s", payload)
         return
+    act_id = int(raw_id)
 
+    gear_uuid = payload.get("gear_uuid")
     if not gear_uuid:
         log.info("User selected 'None' for activity %s — no gear will be associated", act_id)
         return
@@ -301,7 +328,7 @@ def handle_gear_selection(api, payload_str):
             [gear_uuid_dashed],
         )
         if result is None:
-            log.info("Gear association successful (null response is expected for v2 API)")
+            log.info("Gear association successful (204 No Content — expected for v2 API)")
         else:
             log.info("Gear association result: %s", result)
     except Exception as e:
@@ -310,7 +337,12 @@ def handle_gear_selection(api, payload_str):
 
 # ── MQTT setup ────────────────────────────────────────────────────────────────
 
-def build_mqtt_client(api):
+def build_mqtt_client(api_ref):
+    """
+    Build and return a configured MQTT client.
+    api_ref is a list containing the current api object, allowing the
+    message handler to always use the latest api (e.g. after re-auth).
+    """
     client = mqtt.Client(
         mqtt.CallbackAPIVersion.VERSION2,
         client_id="garmin_gear_bot",
@@ -318,7 +350,7 @@ def build_mqtt_client(api):
     )
 
     if MQTT_USER:
-        client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
+        client.username_pw_set(MQTT_USER, MQTT_PASS)
 
     def on_connect(client, userdata, connect_flags, reason_code, properties):
         if reason_code.is_failure:
@@ -335,7 +367,8 @@ def build_mqtt_client(api):
     def on_message(client, userdata, msg):
         log.info("MQTT message received on %s", msg.topic)
         if msg.topic == MQTT_TOPIC_GEAR_SELECT:
-            handle_gear_selection(api, msg.payload.decode("utf-8"))
+            # Always use the current api object from the mutable reference
+            handle_gear_selection(api_ref[0], msg.payload.decode("utf-8"))
 
     client.on_connect    = on_connect
     client.on_disconnect = on_disconnect
@@ -359,8 +392,12 @@ def main():
     state = load_state()
     log.info("Last seen activity ID: %s", state.get("last_activity_id", "none"))
 
+    # Mutable reference so on_message always uses the latest api object,
+    # even after a re-authentication replaces it in the poll loop.
+    api_ref = [api]
+
     # Connect to MQTT
-    mqtt_client = build_mqtt_client(api)
+    mqtt_client = build_mqtt_client(api_ref)
     try:
         mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
     except Exception as e:
@@ -385,7 +422,8 @@ def main():
     log.info("Starting poll loop (checking every %s seconds)", POLL_INTERVAL)
     while True:
         try:
-            state = check_for_new_activity(api, state, mqtt_client)
+            state, api = check_for_new_activity(api, state, mqtt_client)
+            api_ref[0] = api  # keep the MQTT handler's reference current
         except Exception as e:
             log.error("Unexpected error in poll loop: %s", e, exc_info=True)
         time.sleep(POLL_INTERVAL)
