@@ -1,0 +1,33 @@
+name: Build and push garmin-gear-bot
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'garmin-gear-bot/**'
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./garmin-gear-bot
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/garmin-gear-bot:latest
