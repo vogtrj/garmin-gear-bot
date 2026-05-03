@@ -194,13 +194,11 @@ def get_relevant_gear(api, activity_type):
     return [
         {
             "uuid": g["uuid"],
-            "name": g.get("displayName", "Unknown"),
+            "name": g.get("displayName") or g.get("customMakeModel", "Unknown"),
             "type": g.get("gearTypeName", "Unknown"),
         }
         for g in active
-        if g.get("displayName")  # skip items with no display name
     ]
-
 
 # ── Garmin polling ────────────────────────────────────────────────────────────
 
