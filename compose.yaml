@@ -1,6 +1,6 @@
 services:
   garmin-gear-bot:
-    build: .
+    image: ghcr.io/vogtrj/garmin-gear-bot:latest
     container_name: garmin-gear-bot
     restart: unless-stopped
     env_file:
