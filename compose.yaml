@@ -1,0 +1,20 @@
+services:
+  garmin-gear-bot:
+    build: .
+    container_name: garmin-gear-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persists Garmin auth tokens and last-seen activity ID across restarts
+      - ${VOLUMES}/garmin-gear-bot:/data
+    networks:
+      # Communicates with NodeRED via MQTT, so minimally needs access to the mqtt network
+      - mqtt
+
+volumes:
+  garmin_data:
+
+networks:
+  mqtt:
+    external: true
