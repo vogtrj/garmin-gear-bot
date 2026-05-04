@@ -381,7 +381,7 @@ def build_mqtt_client(api_ref):
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("garmin_gear_bot starting up")
+    log.info("garmin_gear_bot starting up v20260504.")
     log.info("Poll interval: %ss | MQTT: %s:%s", POLL_INTERVAL, MQTT_HOST, MQTT_PORT)
 
     # Authenticate with Garmin
