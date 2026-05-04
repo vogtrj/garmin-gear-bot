@@ -79,9 +79,10 @@ ACTIVITY_GEAR_FILTER = {
 if POLL_INTERVAL < 120:
     log.warning(
         "POLL_INTERVAL is %ss — this is very aggressive. "
-        "Recommend at least 120s to avoid Garmin rate limiting.",
+        "Increasing to 120s to avoid Garmin rate limiting.",
         POLL_INTERVAL,
     )
+    POLL_INTERVAL = 120
 
 # ── State persistence ─────────────────────────────────────────────────────────
 
@@ -295,7 +296,7 @@ def handle_gear_selection(api, payload_str):
 
     Expected payload:
         {"activity_id": 12345, "gear_uuid": "abc123"}  — associate gear
-        {"activity_id": 12345, "gear_uuid": null}       — user chose "None"
+        {"activity_id": 12345, "gear_uuid": null}      — user chose "None"
     """
     try:
         payload = json.loads(payload_str)
