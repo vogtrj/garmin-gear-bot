@@ -55,7 +55,7 @@ MQTT_PASS      = os.environ.get("MQTT_PASSWORD", "")
 MQTT_TOPIC_NEW_ACTIVITY = os.environ.get("MQTT_TOPIC_NEW_ACTIVITY", "garmin/activity/new")
 MQTT_TOPIC_GEAR_SELECT  = os.environ.get("MQTT_TOPIC_GEAR_SELECT",  "garmin/activity/gear_select")
 
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 300))   # seconds
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 3600))   # seconds
 STATE_FILE    = os.environ.get("STATE_FILE", "/data/state.json")
 TOKEN_FILE    = os.environ.get("TOKEN_FILE", "/data/garmin_tokens.pkl")
 
