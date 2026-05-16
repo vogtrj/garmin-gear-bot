@@ -15,15 +15,21 @@ Garmin Connect tracks cumulative usage on gear like running shoes, but it only a
 ### System Overview
 
 ```
-┌─────────────────┐     polls at set    ┌──────────────────────┐
-│  Garmin Connect │ ◄── interval  ────  │  garmin-gear-bot     │
-│  (activity log) │                     │  (Python container)  │
-└─────────────────┘                     └──────────┬───────────┘
-                                                   │ MQTT publish
-                                                   ▼
-                                         garmin/activity/new
-                                                   │
-                                                   ▼
+┌─────────────────┐                     ┌─────────────────┐
+│    Node-RED     │ ── garmin/trigger ─► │  garmin-gear-bot│
+│  (Inject node)  │      /check         │ (Python service) │
+└─────────────────┘                     └────────┬────────┘
+                                                  │ Garmin Connect API
+                                                  ▼
+                                         ┌─────────────────┐
+                                         │  Garmin Connect │
+                                         │ (activity log)  │
+                                         └────────┬────────┘
+                                                  │ new activity found
+                                                  ▼
+                                        garmin/activity/new
+                                                  │
+                                                  ▼
                                          ┌─────────────────┐
                                          │    Node-RED     │
                                          └────────┬────────┘
@@ -43,12 +49,12 @@ Garmin Connect tracks cumulative usage on gear like running shoes, but it only a
                                         garmin/activity/gear_select
                                                   │
                                                   ▼
-                                        ┌──────────────────────┐
-                                        │  garmin-gear-bot     │
-                                        │  (Python container)  │
-                                        └──────────┬───────────┘
-                                                   │ PUT API call
-                                                   ▼
+                                        ┌─────────────────┐
+                                        │  garmin-gear-bot│
+                                        │ (Python service) │
+                                        └────────┬────────┘
+                                                  │ PUT API call
+                                                  ▼
                                         ┌─────────────────┐
                                         │  Garmin Connect │
                                         │  (gear updated) │
@@ -57,15 +63,17 @@ Garmin Connect tracks cumulative usage on gear like running shoes, but it only a
 
 ### Step-by-Step Data Flow
 
-1. **Polling** — The Python service polls the Garmin Connect API at a set interval. It compares the most recent activity ID against a persisted last-seen ID stored in `/data/state.json`.
+1. **Trigger** — A Node-RED Inject node fires on a configurable schedule and publishes a message to the MQTT topic `garmin/trigger/check`. The Python service receives this and runs an activity check.
 
-2. **New activity detected** — When a new activity is found, the service fetches your gear list and filters it to types relevant to the activity (e.g. shoes for a run, bikes for a ride). It publishes a JSON payload to the MQTT topic `garmin/activity/new`.
+2. **Activity check** — The service fetches the most recent activity from Garmin Connect and compares its ID against a persisted last-seen ID stored in `/data/state.json`. If nothing is new, it logs accordingly and waits for the next trigger.
 
-3. **Telegram notification** — A Node-RED flow subscribes to that MQTT topic. On receiving a message, it formats a Telegram message with the activity details and presents your gear options as inline keyboard buttons, with a "None" option always included.
+3. **New activity detected** — When a new activity is found, the service fetches your gear list and filters it to types relevant to the activity (e.g. shoes for a run, bikes for a ride). It publishes a JSON payload to the MQTT topic `garmin/activity/new`.
 
-4. **User responds** — You tap a gear option on your phone. Telegram sends a callback query back to the Node-RED bot receiver. Node-RED extracts your selection, edits the original message to show a confirmation (removing the buttons), and publishes your choice to the MQTT topic `garmin/activity/gear_select`.
+4. **Telegram notification** — A Node-RED flow subscribes to that MQTT topic. On receiving a message, it formats a Telegram message with the activity details and presents your gear options as inline keyboard buttons, with a "None" option always included.
 
-5. **Garmin updated** — The Python service receives the gear selection via MQTT and calls the Garmin Connect v2 API to associate the selected gear with the activity. The gear's usage mileage is updated accordingly.
+5. **User responds** — You tap a gear option on your phone. Telegram sends a callback query back to the Node-RED bot receiver. Node-RED extracts your selection, edits the original message to show a confirmation (removing the buttons), and publishes your choice to the MQTT topic `garmin/activity/gear_select`.
+
+6. **Garmin updated** — The Python service receives the gear selection via MQTT and calls the Garmin Connect v2 API to associate the selected gear with the activity. The gear's usage mileage is updated accordingly.
 
 ---
 
@@ -73,12 +81,11 @@ Garmin Connect tracks cumulative usage on gear like running shoes, but it only a
 
 ```
 garmin-gear-bot/
-├── garmin_service.py      # Main Python service (polling, MQTT, Garmin API)
+├── garmin_service.py      # Main Python service (MQTT trigger, Garmin API)
 ├── Dockerfile             # Container definition
 ├── requirements.txt       # Python dependencies
 ├── compose.yaml           # Docker Compose service definition
-├── env.example            # Template for required environment variables
-├── .gitignore             # Ensures .env and data files are never committed
+├── .env                   # Environment variables (never commit this)
 └── .github/
     └── workflows/
         └── build.yml      # GitHub Actions — builds and pushes image to ghcr.io
@@ -89,7 +96,8 @@ garmin-gear-bot/
 **`garmin_service.py`**
 The core of the system. Handles:
 - Garmin Connect authentication with token persistence (avoids repeated SSO logins)
-- Polling for new activities on a configurable interval
+- Listening for MQTT trigger messages from Node-RED
+- Checking Garmin Connect for new activities on demand
 - Filtering gear by activity type
 - Publishing activity data to MQTT
 - Receiving gear selections from MQTT and writing them to Garmin Connect via the v2 API
@@ -101,10 +109,11 @@ Builds a minimal Python 3.12 slim image. Dependencies are installed in a separat
 Defines the Docker service. References the pre-built image from GitHub Container Registry (ghcr.io) so the container host never needs to build locally. Mounts a named volume at `/data` to persist authentication tokens and state across container restarts.
 
 **`build.yml`** (GitHub Actions)
-Triggered automatically on any push to `main` that modifies `garmin_service.py`, `Dockerfile`, or `requirements.txt`. Builds the Docker image and pushes it to `ghcr.io/<your-username>/garmin-gear-bot:latest`. This means deploying an update is just a `git push` followed by a container restart on the host.
+Triggered automatically on any push to `main` that modifies `garmin_service.py`, `Dockerfile`, or `requirements.txt`. Builds the Docker image and pushes it to `ghcr.io/<your-username>/garmin-gear-bot:latest`. Deploying an update is just a `git push` followed by a container restart on the host.
 
 **Node-RED flow** (not in this repo — lives in your Node-RED instance)
-Two function nodes handle the Telegram interaction:
+Three key nodes drive the integration:
+- `Inject` — fires on a schedule and publishes to `garmin/trigger/check` to initiate activity checks
 - `Build Telegram message` — formats the activity notification and constructs the inline keyboard
 - `Handle gear selection` — receives the button tap, edits the message to show confirmation, and publishes the selection to MQTT
 
@@ -147,14 +156,14 @@ The `profileId` field is what you need — **not** the `id` field.
 
 ### 1. Configure Environment Variables
 
-Copy `env.example` to `.env` in the same directory as `compose.yaml` and fill in your values:
+Copy `.env.example` to `.env` in the same directory as `compose.yaml` and fill in your values:
 
 ```bash
-cp env.example .env
+cp .env.example .env
 nano .env
 ```
 
-The `.env` file is listed in `.gitignore` and should **never be committed to version control**.
+The `.env` file should **never be committed to version control**.
 
 ```env
 # Garmin Connect credentials
@@ -171,11 +180,9 @@ MQTT_USER=
 MQTT_PASSWORD=
 
 # MQTT topics (defaults shown — only change if needed)
+MQTT_TOPIC_TRIGGER=garmin/trigger/check
 MQTT_TOPIC_NEW_ACTIVITY=garmin/activity/new
 MQTT_TOPIC_GEAR_SELECT=garmin/activity/gear_select
-
-# Poll interval in seconds. Do not go below 120.
-POLL_INTERVAL=300
 ```
 
 ### 2. Update the Compose File
@@ -216,14 +223,32 @@ docker compose logs -f
 A healthy startup looks like this:
 
 ```
-2026-05-03 00:00:00  INFO      garmin_gear_bot starting up
-2026-05-03 00:00:00  INFO      Poll interval: 300s | MQTT: mosquitto:1883
-2026-05-03 00:00:00  INFO      Loading saved Garmin tokens from /data/garmin_tokens.pkl
-2026-05-03 00:00:00  INFO      Garmin token login successful
-2026-05-03 00:00:00  INFO      Last seen activity ID: 12345678901
-2026-05-03 00:00:00  INFO      MQTT connected to mosquitto:1883
-2026-05-03 00:00:00  INFO      Subscribed to garmin/activity/gear_select
-2026-05-03 00:00:00  INFO      Starting poll loop (checking every 300 seconds)
+2026-05-16 00:00:00  INFO      garmin_gear_bot starting up v20260516.
+2026-05-16 00:00:00  INFO      Trigger topic: garmin/trigger/check | MQTT: mosquitto:1883
+2026-05-16 00:00:00  INFO      Loading saved Garmin tokens from /data/garmin_tokens.pkl
+2026-05-16 00:00:00  INFO      Garmin token login successful
+2026-05-16 00:00:00  INFO      Last seen activity ID: 12345678901
+2026-05-16 00:00:00  INFO      MQTT connected to mosquitto:1883
+2026-05-16 00:00:00  INFO      Subscribed to trigger topic garmin/trigger/check
+2026-05-16 00:00:00  INFO      Subscribed to garmin/activity/gear_select
+2026-05-16 00:00:00  INFO      Waiting for trigger messages on garmin/trigger/check
+```
+
+When a trigger fires and no new activity is found:
+
+```
+2026-05-16 08:00:00  INFO      MQTT message received on garmin/trigger/check
+2026-05-16 08:00:00  INFO      Activity check triggered by Node-RED
+2026-05-16 08:00:00  INFO      No new activity (last seen: 12345678901)
+```
+
+When a new activity is detected:
+
+```
+2026-05-16 08:00:00  INFO      Activity check triggered by Node-RED
+2026-05-16 08:00:00  INFO      New activity detected: Morning Run (ID: 12345678902, type: running)
+2026-05-16 08:00:00  INFO      Publishing new activity to MQTT topic 'garmin/activity/new'
+2026-05-16 08:00:00  INFO      Gear options: ['Nike Pegasus 40', 'Saucony Kinvara 14']
 ```
 
 **First startup note:** On first run, there is no saved token file. The service will log into Garmin Connect using your email and password and save a token to `/data/garmin_tokens.pkl`. Garmin's SSO endpoint can occasionally return a 429 (rate limited) error on the first login attempt — this is normal. The service includes a fallback login method and will typically succeed despite the 429 warning. Once the token is saved, subsequent startups reuse it and never touch the SSO endpoint.
@@ -240,11 +265,21 @@ After importing, configure the following nodes:
 
 | Node | What to configure |
 |---|---|
+| `Inject` (trigger) | Set your desired check interval; configure MQTT out to point at `garmin/trigger/check` |
 | `garmin/activity/new` (MQTT in) | Select your MQTT broker |
 | `Build Telegram message` (function) | Replace `CHAT_ID` with your Telegram user ID |
 | `Send via GarminGearBot` (Telegram sender) | Select your bot config |
 | `Edit Telegram message` (Telegram sender) | Select your bot config |
 | `garmin/activity/gear_select` (MQTT out) | Select your MQTT broker |
+
+### Trigger Node Setup
+
+The trigger is a standard Node-RED **Inject** node wired to an **MQTT Out** node:
+
+- **Inject node** — set to repeat on an interval (e.g. every hour). The payload can be anything; the Python service ignores the message content and treats receipt as the signal to check.
+- **MQTT Out node** — topic: `garmin/trigger/check` (or whatever you set `MQTT_TOPIC_TRIGGER` to in `.env`), QoS 1.
+
+You can also wire additional trigger sources — a dashboard button, a flow that fires after your phone connects to home Wi-Fi, or any other event that makes sense for your routine.
 
 ### Finding Your Telegram Chat ID
 
@@ -280,6 +315,8 @@ Before recording a real activity, inject a test payload to verify the full Teleg
 
 Note: using a fake `activity_id` (like `99999999`) means the gear write to Garmin Connect will fail, which is fine for testing the Telegram flow. Use a real activity ID if you want to test the full end-to-end write.
 
+You can also test the trigger path end-to-end by clicking the Inject node's button manually — this fires a check immediately without waiting for the schedule.
+
 ---
 
 ## Updating the Service
@@ -296,7 +333,7 @@ docker compose pull
 docker compose up -d
 ```
 
-The named volume (`garmin_data`) persists across updates — your auth tokens and last-seen activity ID are preserved.
+The named volume persists across updates — your auth tokens and last-seen activity ID are preserved.
 
 ---
 
@@ -322,8 +359,12 @@ To add or modify activity type mappings, update the `ACTIVITY_GEAR_FILTER` dict 
 
 - Check Docker logs: `docker compose logs -f`
 - Confirm the activity appeared in Garmin Connect — the service only detects activities that have fully synced
-- The poll interval means detection can take up to 5 minutes after sync
-- Verify MQTT is working by checking the broker logs or subscribing to `garmin/activity/new` manually:
+- Check that the Node-RED trigger is firing: look for `Activity check triggered by Node-RED` in the logs
+- Verify MQTT is working by subscribing to the trigger topic manually:
+  ```bash
+  mosquitto_sub -h your-broker-ip -t "garmin/trigger/check" -v
+  ```
+- Also check the activity output topic:
   ```bash
   mosquitto_sub -h your-broker-ip -t "garmin/activity/new" -v
   ```
@@ -350,6 +391,10 @@ To add or modify activity type mappings, update the `ACTIVITY_GEAR_FILTER` dict 
 
 - A required environment variable is missing. Check that `.env` exists and contains `GARMIN_EMAIL`, `GARMIN_PASSWORD`, and `GARMIN_PROFILE_ID`.
 
+**Service is connected but never checks for activities**
+
+- The Python service is passive — it only runs a check when it receives a trigger message on `garmin/trigger/check`. Verify the Node-RED Inject node is running on its schedule and that the MQTT Out node is connected to the right broker and topic.
+
 ---
 
 ## Architecture Notes
@@ -358,13 +403,13 @@ To add or modify activity type mappings, update the `ACTIVITY_GEAR_FILTER` dict 
 
 Garmin provides an official Health API with real webhooks, but it requires applying for partner access and is intended for commercial products. For personal automation, the community-maintained `garminconnect` Python library provides equivalent access via the same endpoints used by the Garmin Connect web app.
 
-### Why polling instead of webhooks?
+### Why is the schedule in Node-RED instead of the Python service?
 
-The unofficial API has no webhook support — polling is the only option. A 5-minute interval is a reasonable balance between responsiveness and API courtesy. Do not set `POLL_INTERVAL` below 120 seconds.
+Putting the schedule in Node-RED keeps the Python service simple and stateless with respect to timing — it does exactly one thing when asked. It also means you can adjust the check frequency, pause checks, or trigger a check manually (by clicking the Inject node) without touching the Python container at all. Any event in Node-RED can serve as a trigger: a time schedule, a dashboard button, a geofence event, or anything else.
 
 ### Why MQTT as the message bus?
 
-MQTT decouples the Python service from Node-RED cleanly. Either component can restart independently without losing messages (QoS 1 ensures at-least-once delivery). It also makes the system extensible — other automations can subscribe to `garmin/activity/new` for their own purposes without modifying this service.
+MQTT decouples the Python service from Node-RED cleanly. Either component can restart independently without losing messages (QoS 1 ensures at-least-once delivery). It also makes the system extensible — other automations can subscribe to `garmin/activity/new` for their own purposes without modifying this service, and additional trigger sources can publish to `garmin/trigger/check` without any changes on the Python side.
 
 ### Token persistence
 
