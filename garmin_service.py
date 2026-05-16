@@ -2,17 +2,20 @@
 """
 garmin_gear_bot — main service
 -------------------------------
-Polls Garmin Connect for new activities, publishes them to MQTT,
-and listens for gear selection responses to write back to Garmin.
+Listens for an MQTT trigger from Node-RED, checks Garmin Connect for new
+activities, publishes them to MQTT, and listens for gear selection responses
+to write back to Garmin.
 
 Flow:
-  1. Poll Garmin every POLL_INTERVAL seconds
-  2. On new activity → publish to MQTT_TOPIC_NEW_ACTIVITY
-  3. Node-RED receives → sends Telegram inline-keyboard prompt to user
-  4. User taps gear choice → Node-RED publishes to MQTT_TOPIC_GEAR_SELECT
-  5. This service receives → writes gear association to Garmin Connect
+  1. Node-RED publishes a trigger to MQTT_TOPIC_TRIGGER on its own schedule
+  2. This service receives the trigger → checks Garmin for new activity
+  3. On new activity → publish to MQTT_TOPIC_NEW_ACTIVITY
+  4. Node-RED receives → sends Telegram inline-keyboard prompt to user
+  5. User taps gear choice → Node-RED publishes to MQTT_TOPIC_GEAR_SELECT
+  6. This service receives → writes gear association to Garmin Connect
 
 MQTT topics (configurable via env):
+  Subscribe: garmin/trigger/check         — trigger from Node-RED to run a check
   Publish:   garmin/activity/new          — new activity + gear options
   Subscribe: garmin/activity/gear_select  — user's gear selection
 """
@@ -23,7 +26,6 @@ import os
 import pickle
 import signal
 import sys
-import time
 
 import paho.mqtt.client as mqtt
 
@@ -54,10 +56,10 @@ MQTT_USER      = os.environ.get("MQTT_USER", "")
 MQTT_PASS      = os.environ.get("MQTT_PASSWORD", "")
 MQTT_TOPIC_NEW_ACTIVITY = os.environ.get("MQTT_TOPIC_NEW_ACTIVITY", "garmin/activity/new")
 MQTT_TOPIC_GEAR_SELECT  = os.environ.get("MQTT_TOPIC_GEAR_SELECT",  "garmin/activity/gear_select")
+MQTT_TOPIC_TRIGGER      = os.environ.get("MQTT_TOPIC_TRIGGER",      "garmin/trigger/check")
 
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 3600))   # seconds
-STATE_FILE    = os.environ.get("STATE_FILE", "/data/state.json")
-TOKEN_FILE    = os.environ.get("TOKEN_FILE", "/data/garmin_tokens.pkl")
+STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
+TOKEN_FILE = os.environ.get("TOKEN_FILE", "/data/garmin_tokens.pkl")
 
 # Activity type → relevant gear types to present to user.
 # Activities whose type isn't listed will get all active gear.
@@ -73,16 +75,6 @@ ACTIVITY_GEAR_FILTER = {
     "mountain_biking":   {"Bike", "Bikes"},
     "indoor_cycling":    {"Bike", "Bikes"},
 }
-
-# ── Startup validation ────────────────────────────────────────────────────────
-
-if POLL_INTERVAL < 120:
-    log.warning(
-        "POLL_INTERVAL is %ss — this is very aggressive. "
-        "Increasing to 120s to avoid Garmin rate limiting.",
-        POLL_INTERVAL,
-    )
-    POLL_INTERVAL = 120
 
 # ── State persistence ─────────────────────────────────────────────────────────
 
@@ -240,7 +232,7 @@ def check_for_new_activity(api, state, mqtt_client):
     duration = latest.get("duration")
 
     if str(act_id) == str(state.get("last_activity_id")):
-        log.debug("No new activity (last seen: %s)", act_id)
+        log.info("No new activity (last seen: %s)", act_id)
         return state, api
 
     log.info("New activity detected: %s (ID: %s, type: %s)", act_name, act_id, act_type)
@@ -336,11 +328,12 @@ def handle_gear_selection(api, payload_str):
 
 # ── MQTT setup ────────────────────────────────────────────────────────────────
 
-def build_mqtt_client(api_ref):
+def build_mqtt_client(api_ref, state_ref):
     """
     Build and return a configured MQTT client.
-    api_ref is a list containing the current api object, allowing the
-    message handler to always use the latest api (e.g. after re-auth).
+    api_ref and state_ref are single-element lists used as mutable containers
+    so that the message handlers always operate on the latest objects (e.g.
+    after a re-authentication replaces the api, or a check updates the state).
     """
     client = mqtt.Client(
         mqtt.CallbackAPIVersion.VERSION2,
@@ -356,6 +349,8 @@ def build_mqtt_client(api_ref):
             log.error("MQTT connection failed: %s", reason_code)
         else:
             log.info("MQTT connected to %s:%s", MQTT_HOST, MQTT_PORT)
+            client.subscribe(MQTT_TOPIC_TRIGGER, qos=1)
+            log.info("Subscribed to trigger topic %s", MQTT_TOPIC_TRIGGER)
             client.subscribe(MQTT_TOPIC_GEAR_SELECT, qos=1)
             log.info("Subscribed to %s", MQTT_TOPIC_GEAR_SELECT)
 
@@ -365,7 +360,12 @@ def build_mqtt_client(api_ref):
 
     def on_message(client, userdata, msg):
         log.info("MQTT message received on %s", msg.topic)
-        if msg.topic == MQTT_TOPIC_GEAR_SELECT:
+        if msg.topic == MQTT_TOPIC_TRIGGER:
+            log.info("Activity check triggered by Node-RED")
+            new_state, new_api = check_for_new_activity(api_ref[0], state_ref[0], client)
+            state_ref[0] = new_state
+            api_ref[0]   = new_api
+        elif msg.topic == MQTT_TOPIC_GEAR_SELECT:
             # Always use the current api object from the mutable reference
             handle_gear_selection(api_ref[0], msg.payload.decode("utf-8"))
 
@@ -381,8 +381,8 @@ def build_mqtt_client(api_ref):
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("garmin_gear_bot starting up v20260504.")
-    log.info("Poll interval: %ss | MQTT: %s:%s", POLL_INTERVAL, MQTT_HOST, MQTT_PORT)
+    log.info("garmin_gear_bot starting up v20260516.")
+    log.info("Trigger topic: %s | MQTT: %s:%s", MQTT_TOPIC_TRIGGER, MQTT_HOST, MQTT_PORT)
 
     # Authenticate with Garmin
     api = garmin_authenticate()
@@ -391,12 +391,13 @@ def main():
     state = load_state()
     log.info("Last seen activity ID: %s", state.get("last_activity_id", "none"))
 
-    # Mutable reference so on_message always uses the latest api object,
-    # even after a re-authentication replaces it in the poll loop.
-    api_ref = [api]
+    # Mutable single-element lists so on_message callbacks always operate on
+    # the latest objects, even after re-authentication or a state update.
+    api_ref   = [api]
+    state_ref = [state]
 
     # Connect to MQTT
-    mqtt_client = build_mqtt_client(api_ref)
+    mqtt_client = build_mqtt_client(api_ref, state_ref)
     try:
         mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
     except Exception as e:
@@ -404,28 +405,18 @@ def main():
         log.error("Check MQTT_HOST and MQTT_PORT and that the broker is reachable.")
         sys.exit(1)
 
-    # Start MQTT network loop in background thread
-    mqtt_client.loop_start()
-
-    # Graceful shutdown
+    # Graceful shutdown — disconnect() causes loop_forever() to return cleanly
     def shutdown(sig, frame):
         log.info("Shutdown signal received — stopping")
-        mqtt_client.loop_stop()
         mqtt_client.disconnect()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    # Main polling loop
-    log.info("Starting poll loop (checking every %s seconds)", POLL_INTERVAL)
-    while True:
-        try:
-            state, api = check_for_new_activity(api, state, mqtt_client)
-            api_ref[0] = api  # keep the MQTT handler's reference current
-        except Exception as e:
-            log.error("Unexpected error in poll loop: %s", e, exc_info=True)
-        time.sleep(POLL_INTERVAL)
+    # Block here; all work is driven by incoming MQTT messages
+    log.info("Waiting for trigger messages on %s", MQTT_TOPIC_TRIGGER)
+    mqtt_client.loop_forever()
 
 
 if __name__ == "__main__":
